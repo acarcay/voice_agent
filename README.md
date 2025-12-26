@@ -2,20 +2,30 @@
   <img src="./.github/assets/livekit-mark.png" alt="LiveKit logo" width="100" height="100">
 </a>
 
-# LiveKit Agents Starter - Python
+# Depo Stok Takip Asistanı (Warehouse Inventory Voice Assistant)
 
-A complete starter project for building voice AI apps with [LiveKit Agents for Python](https://github.com/livekit/agents) and [LiveKit Cloud](https://cloud.livekit.io/).
+A voice AI assistant for warehouse inventory management, built with [LiveKit Agents for Python](https://github.com/livekit/agents) and [LiveKit Cloud](https://cloud.livekit.io/).
 
-The starter project includes:
+## Features
 
-- A simple voice AI assistant, ready for extension and customization
-- A voice AI pipeline with [models](https://docs.livekit.io/agents/models) from OpenAI, Cartesia, and AssemblyAI served through LiveKit Cloud
-  - Easily integrate your preferred [LLM](https://docs.livekit.io/agents/models/llm/), [STT](https://docs.livekit.io/agents/models/stt/), and [TTS](https://docs.livekit.io/agents/models/tts/) instead, or swap to a realtime model like the [OpenAI Realtime API](https://docs.livekit.io/agents/models/realtime/openai)
-- Eval suite based on the LiveKit Agents [testing & evaluation framework](https://docs.livekit.io/agents/build/testing/)
-- [LiveKit Turn Detector](https://docs.livekit.io/agents/build/turns/turn-detector/) for contextually-aware speaker detection, with multilingual support
-- [Background voice cancellation](https://docs.livekit.io/home/cloud/noise-cancellation/)
-- Integrated [metrics and logging](https://docs.livekit.io/agents/build/metrics/)
-- A Dockerfile ready for [production deployment](https://docs.livekit.io/agents/ops/deployment/)
+- **Voice-Activated Inventory Management**: Check stock levels and update inventory using natural language
+- **Smart Fuzzy Matching**: Find items even with partial or misspelled names
+- **Real-Time Stock Updates**: Add or remove items from inventory with instant feedback
+- **Military-Style Communication**: Direct, concise responses focused on efficiency
+- **LiveKit Voice Pipeline**: Powered by OpenAI LLM, Deepgram STT, and ElevenLabs TTS served through LiveKit Cloud
+- **Production-Ready Infrastructure**: 
+  - [LiveKit Turn Detector](https://docs.livekit.io/agents/build/turns/turn-detector/) for contextually-aware speaker detection
+  - [Background voice cancellation](https://docs.livekit.io/home/cloud/noise-cancellation/)
+  - Integrated [metrics and logging](https://docs.livekit.io/agents/build/metrics/)
+  - Dockerfile ready for [production deployment](https://docs.livekit.io/agents/ops/deployment/)
+
+## How It Works
+
+The assistant responds to natural language commands for inventory operations:
+
+- **Stock Inquiry**: "Fren diskinden kaç tane var?" → "Fren Diski: 145 adet, Raf A3"
+- **Add Stock**: "Yağ filtresinden 10 tane koydum" → "Güncellendi. Yeni stok: 30 adet."
+- **Remove Stock**: "V kayışından 3 tane aldım" → "Güncellendi. Yeni stok: 2 adet."
 
 This starter app is compatible with any [custom web/mobile frontend](https://docs.livekit.io/agents/start/frontend/) or [SIP-based telephony](https://docs.livekit.io/agents/start/telephony/).
 
@@ -40,6 +50,26 @@ You can load the LiveKit environment automatically using the [LiveKit CLI](https
 lk cloud auth
 lk app env -w -d .env.local
 ```
+
+### Additional Configuration (Optional)
+
+You can customize the warehouse name by adding this to your `.env.local`:
+
+```bash
+WAREHOUSE_NAME="Your Warehouse Name"
+```
+
+### Current Inventory Database
+
+The system includes a sample in-memory inventory database with these items:
+
+| Item ID | Name | Quantity | Location |
+|---------|------|----------|----------|
+| STK-001 | Fren Diski | 145 | Raf A3 |
+| STK-002 | Yağ Filtresi | 20 | Raf B1 |
+| STK-003 | V Kayışı | 5 | Depo Giriş |
+
+> **Note**: To use a real database instead of the fake in-memory DB, modify `src/database_manager.py` to connect to your preferred storage solution.
 
 ## Run the agent
 
