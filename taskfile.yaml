@@ -56,3 +56,60 @@ tasks:
     interactive: true
     cmds:
       - "uv run src/agent.py dev"
+
+  # ==================== Infrastructure Tasks ====================
+  
+  db:up:
+    desc: "Start PostgreSQL and Redis containers"
+    cmds:
+      - docker-compose up -d postgres redis
+      - echo "⏳ Waiting for services to be healthy..."
+      - sleep 3
+      - docker-compose ps
+
+  db:down:
+    desc: "Stop all containers"
+    cmds:
+      - docker-compose down
+
+  db:reset:
+    desc: "Stop containers and remove volumes (DESTRUCTIVE)"
+    cmds:
+      - docker-compose down -v
+      - echo "🗑️  All data removed"
+
+  db:migrate:
+    desc: "Run database migrations"
+    cmds:
+      - uv run alembic upgrade head
+
+  db:migrate:create:
+    desc: "Create a new migration (usage: task db:migrate:create -- 'description')"
+    cmds:
+      - uv run alembic revision --autogenerate -m "{{.CLI_ARGS}}"
+
+  db:seed:
+    desc: "Seed database with sample appointments"
+    cmds:
+      - uv run python src/scripts/seed_db.py --clear
+
+  # ==================== One-Command Setup ====================
+  
+  setup:
+    desc: "🚀 Full setup: containers + migrate + seed"
+    cmds:
+      - task: install
+      - task: db:up
+      - echo "⏳ Waiting for database to be ready..."
+      - sleep 2
+      - task: db:migrate
+      - task: db:seed
+      - echo ""
+      - echo "✅ Environment ready!"
+      - echo "   Run 'task dev' to start the agent"
+
+  start-calls:
+    desc: "Run the call initiator script"
+    cmds:
+      - uv run python src/start_calls.py
+

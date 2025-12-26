@@ -1,0 +1,83 @@
+# Voice Agent - Docker Compose Configuration
+# Usage: docker-compose up -d
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: voice_agent_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-voice_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voice_agent_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-voice_agent}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-voice_agent}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: voice_agent_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Voice Agent Application (optional - for containerized development)
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voice_agent_app
+    env_file:
+      - .env.local
+    environment:
+      # Override database/redis URLs to use container hostnames
+      DATABASE_URL: postgresql://${POSTGRES_USER:-voice_agent}:${POSTGRES_PASSWORD:-voice_agent_dev}@postgres:5432/${POSTGRES_DB:-voice_agent}
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      # Mount source for hot-reloading during development
+      - ./src:/app/src:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Don't start by default - use for production deployment
+    profiles:
+      - full
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+
+# Usage:
+# ------
+# Start infrastructure only (recommended for local dev):
+#   docker-compose up -d postgres redis
+#
+# Start everything including app:
+#   docker-compose --profile full up -d
+#
+# View logs:
+#   docker-compose logs -f
+#
+# Stop all:
+#   docker-compose down
+#
+# Reset database:
+#   docker-compose down -v  (removes volumes)

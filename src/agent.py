@@ -1,11 +1,24 @@
-import logging
+"""
+Voice Agent - Production Implementation
+
+A LiveKit-based voice AI agent for warehouse inventory management.
+
+Features:
+- Dependency injection for database and state managers
+- Retry logic with tenacity for external API calls
+- Structured logging with PII redaction
+- Async-safe operations with proper locking
+"""
+
 import asyncio
 import os
 import json
+import logging
 from datetime import datetime
 from typing import Optional
 
-import elevenlabs
+import structlog
+from livekit.plugins import elevenlabs
 from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
@@ -23,357 +36,297 @@ from livekit.plugins import noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit.agents.llm import function_tool
 
-logger = logging.getLogger("agent")
+from database_manager import DatabaseManager, get_database, init_database
+
+# Load environment variables
 load_dotenv(".env.local")
 
-# Veritabanı simülasyonu - Production'da gerçek DB kullanın
-FAKE_APPOINTMENTS_DB = [
-    {"appointment_id": "randevu_101", "customer_name": "Ahmet Yılmaz", "time": "14:30", "status": "Beklemede"},
-    {"appointment_id": "randevu_102", "customer_name": "Zeynep Kaya", "time": "16:00", "status": "Beklemede"},
-]
-
-# Konuşma kayıtları için
-CONVERSATION_LOGS = []
-
-
-# Metrikler için
-class CallMetrics:
-    def __init__(self):
-        self.total_calls = 0
-        self.confirmed = 0
-        self.cancelled = 0
-        self.rescheduled = 0
-        self.no_response = 0
-        self.call_durations = []
-
-    def update(self, status: str, duration: float = 0):
-        self.total_calls += 1
-        if duration > 0:
-            self.call_durations.append(duration)
-
-        if status == "confirmed":
-            self.confirmed += 1
-        elif status == "cancelled":
-            self.cancelled += 1
-        elif status == "rescheduled":
-            self.rescheduled += 1
-        elif status == "no_response":
-            self.no_response += 1
-
-    def get_summary(self):
-        avg_duration = sum(self.call_durations) / len(self.call_durations) if self.call_durations else 0
-        return {
-            "total_calls": self.total_calls,
-            "confirmed": self.confirmed,
-            "cancelled": self.cancelled,
-            "rescheduled": self.rescheduled,
-            "no_response": self.no_response,
-            "average_duration_seconds": round(avg_duration, 2)
-        }
+# Configure structured logging
+def configure_logging():
+    """Configure structlog for JSON output in production."""
+    log_format = os.getenv("LOG_FORMAT", "json")
+    log_level = os.getenv("LOG_LEVEL", "INFO")
+    
+    if log_format == "json":
+        structlog.configure(
+            processors=[
+                structlog.stdlib.filter_by_level,
+                structlog.stdlib.add_logger_name,
+                structlog.stdlib.add_log_level,
+                structlog.processors.TimeStamper(fmt="iso"),
+                structlog.processors.StackInfoRenderer(),
+                structlog.processors.UnicodeDecoder(),
+                redact_pii,
+                structlog.processors.JSONRenderer()
+            ],
+            wrapper_class=structlog.stdlib.BoundLogger,
+            context_class=dict,
+            logger_factory=structlog.stdlib.LoggerFactory(),
+            cache_logger_on_first_use=True,
+        )
+    else:
+        structlog.configure(
+            processors=[
+                structlog.stdlib.add_log_level,
+                structlog.processors.TimeStamper(fmt="iso"),
+                redact_pii,
+                structlog.dev.ConsoleRenderer()
+            ],
+            wrapper_class=structlog.stdlib.BoundLogger,
+            context_class=dict,
+            logger_factory=structlog.stdlib.LoggerFactory(),
+        )
+    
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format="%(message)s"
+    )
 
 
-call_metrics = CallMetrics()
+def redact_pii(logger, method_name, event_dict):
+    """Redact PII from log messages for compliance."""
+    pii_fields = ["phone", "email", "customer_name"]
+    
+    for field in pii_fields:
+        if field in event_dict:
+            value = str(event_dict[field])
+            if field == "phone" and len(value) > 4:
+                event_dict[field] = f"***{value[-4:]}"
+            elif field == "email" and "@" in value:
+                local, domain = value.split("@", 1)
+                event_dict[field] = f"{local[0]}***@{domain}"
+            elif field == "customer_name":
+                parts = value.split()
+                if parts:
+                    event_dict[field] = f"{parts[0][0]}. ***"
+    
+    return event_dict
+
+
+# Initialize logging
+configure_logging()
+logger = structlog.get_logger("agent")
 
 
 class Assistant(Agent):
-    def __init__(self, appointment_id: Optional[str] = None) -> None:
-        self.appointment_id = appointment_id
+    """
+    Voice AI Assistant for warehouse inventory management.
+    
+    Uses dependency injection for:
+    - DatabaseManager: Inventory storage
+    
+    All external operations use retry logic for resilience.
+    """
+    
+    def __init__(
+        self,
+        db_manager: DatabaseManager,
+        staff_name: Optional[str] = None
+    ) -> None:
+        """
+        Initialize the assistant with injected dependencies.
+        
+        Args:
+            db_manager: Database manager for inventory operations.
+            staff_name: Staff member's name for personalization.
+        """
+        self.db_manager = db_manager
+        self.staff_name = staff_name or "Personel"
         self.conversation_start_time = datetime.now()
-        self.no_response_count = 0
-        self.max_no_response = 3
 
-        super().__init__(
-            instructions=self._get_instructions(),
-        )
+        base_instructions = self._get_instructions()
+
+        super().__init__(instructions=base_instructions)
 
     def _get_instructions(self) -> str:
-        clinic_name = os.getenv("CLINIC_NAME", "Sağlık Kliniği")
+        """Generate system instructions for the LLM."""
+        warehouse_name = os.getenv("WAREHOUSE_NAME", "Depo")
         return f"""
-        Senin adın Aslı. {clinic_name}'in randevu asistanısın.
+        Senin adın DepoGPT. {warehouse_name} stok takip asistanısın.
 
-        GÖREV AKIŞI:
-        1. Kendini tanıt ve randevuyu bildir:
-           "Merhaba [Ad] Bey/Hanım, ben Aslı, {clinic_name}'dan arıyorum. Yarın saat [Saat]'te randevunuz var."
+        KİŞİLİK:
+        - Askeri disiplinli, net ve kısa konuş
+        - "Merhaba nasılsın" gibi samimiyete girme
+        - Direkt sonuca odaklan
+        - Her yanıt maksimum 1-2 cümle
 
-        2. Teyit iste:
-           "Randevunuza gelebilecek misiniz?"
-
-        3. Cevaba göre aksiyon al:
-           - EVET/GELECEĞİM/UYGUN → update_appointment_status('Onaylandı') çağır
-             → "Harika! Teşekkür ederim, yarın görüşmek üzere. İyi günler!"
-             → end_call('confirmed') çağır
-
-           - HAYIR/ERTELEMEİSTİYORUM/BAŞKAZAMANA → find_available_slots() çağır
-             → Seçenekleri sun: "Uygun tarihlerimiz: [tarihler]. Hangisi size uygun?"
-             → Seçim yapılırsa → update_appointment_status('Ertelendi - [yeni_tarih]') çağır
-             → end_call('rescheduled') çağır
-
-           - İPTAL/İPTALEDİYORUM/GELEMİYORUM → update_appointment_status('İptal Edildi') çağır
-             → "Anladım, randevunuzu iptal ediyorum. Geçmiş olsun, iyi günler."
-             → end_call('cancelled') çağır
+        GÖREVLER:
+        1. STOK SORGULAMA:
+           - Kullanıcı bir ürün sorduğunda → get_stock_details(item_name) çağır
+           - Yanıt formatı: "[Ürün adı]: [Adet] adet, [Raf konumu]"
+           
+        2. STOK GÜNCELLEME:
+           - "X tane aldım" → update_stock(item_name, X, "remove")
+           - "Y tane koydum" → update_stock(item_name, Y, "add")
+           - Yanıt formatı: "Güncellendi. Yeni stok: [Adet] adet."
 
         KURALLAR:
-        - Her yanıtı maksimum 2-3 cümle tut, kısa ve öz konuş
-        - Nazik ve profesyonel ol ama aşırı samimi olma
-        - Müşteri 3 kez yanıt vermezse: "Sizi rahatsız etmek istemedim, başka zaman tekrar arayacağım. İyi günler."
-          → end_call('no_response') çağır
-        - SADECE randevu konusunda konuş, başka konulara girme
-        - Müşteri bilmediğin bir şey sorarsa: "Bu konuda bilgim yok, kliniği arayarak öğrenebilirsiniz"
-        - Asla hakaret etme, tartışma veya sinirlenme
-
-        ÖNEMLİ: Her aksiyon sonrası mutlaka ilgili function tool'ı çağır!
+        - SADECE stok işlemleri yap, başka konulara girme
+        - Ürün veritabanında yoksa: "Ürün bulunamadı"
+        - Stok yetersizse: "Yetersiz stok"
+        - Gereksiz lafı kesip direkt işlemi yap
+        - MUTLAKA function tool çağır, asla kendin uydurmaktan yanıt verme
         """
 
     @function_tool
-    async def get_appointment_details(self, context: RunContext, appointment_id: str):
-        """
-        Verilen randevu ID'sine ait müşteri adı ve randevu saatini getirir.
+    async def get_stock_details(self, context: RunContext, item_name: str):
+        """Verilen ürün adına ait stok miktarı ve raf konumunu getirir."""
+        if not item_name:
+            logger.error("invalid_item_name", item_name=item_name)
+            return {"error": "Ürün adı gerekli", "success": False}
 
-        Args:
-            appointment_id: Randevu benzersiz kimliği
-
-        Returns:
-            Dict: Müşteri bilgileri veya hata mesajı
-        """
-        if not appointment_id or not isinstance(appointment_id, str):
-            logger.error(f"Geçersiz appointment_id: {appointment_id}")
-            return {"error": "Geçersiz randevu ID", "status": "Hata"}
-
-        logger.info(f"Randevu detayları getiriliyor: {appointment_id}")
+        logger.info("fetching_stock", item_name=item_name)
 
         try:
-            for appt in FAKE_APPOINTMENTS_DB:
-                if appt["appointment_id"] == appointment_id:
-                    return {
-                        "customer_name": appt['customer_name'],
-                        "time": appt['time'],
-                        "status": "Bulundu",
-                        "current_status": appt.get('status', 'Beklemede')
-                    }
+            item = await self.db_manager.get_item(item_name)
+            
+            if not item:
+                logger.warning("item_not_found", item_name=item_name)
+                return {"error": "Ürün bulunamadı", "success": False}
 
-            logger.warning(f"Randevu bulunamadı: {appointment_id}")
-            return {"error": "Randevu bulunamadı.", "status": "Hata"}
+            return {
+                "item_name": item["name"],
+                "quantity": item["quantity"],
+                "location": item["location"],
+                "item_id": item["item_id"],
+                "success": True,
+                "message": f"{item['name']}: {item['quantity']} adet, {item['location']}"
+            }
 
         except Exception as e:
-            logger.error(f"get_appointment_details hatası: {e}", exc_info=True)
-            return {"error": f"Sistem hatası: {str(e)}", "status": "Hata"}
+            logger.error("get_stock_error", error=str(e), item_name=item_name)
+            return {"error": f"Sistem hatası: {str(e)}", "success": False}
 
     @function_tool
-    async def update_appointment_status(
-            self,
-            context: RunContext,
-            appointment_id: str,
-            status: str
-    ):
+    async def update_stock(self, context: RunContext, item_name: str, quantity: int, operation: str):
         """
-        Bir randevunun durumunu günceller.
-
+        Stok miktarını günceller.
+        
         Args:
-            appointment_id: Randevu ID
-            status: Yeni durum ('Onaylandı', 'İptal Edildi', 'Ertelendi - [tarih]')
-
-        Returns:
-            Dict: İşlem sonucu
+            item_name: Ürün adı
+            quantity: Eklenecek veya çıkarılacak miktar
+            operation: 'add' (ekleme) veya 'remove' (çıkarma)
         """
-        valid_statuses = ['Onaylandı', 'İptal Edildi']
+        if not item_name:
+            return {"error": "Ürün adı gerekli", "success": False}
 
-        if not appointment_id:
-            return {"error": "Appointment ID gerekli", "success": False}
+        if operation not in ["add", "remove"]:
+            logger.warning("invalid_operation", operation=operation)
+            return {"error": "Geçersiz işlem. 'add' veya 'remove' olmalı", "success": False}
 
-        # Erteleme durumları için özel kontrol
-        if not (status in valid_statuses or status.startswith('Ertelendi')):
-            logger.warning(f"Geçersiz durum: {status}")
-            return {"error": "Geçersiz durum", "success": False}
-
-        logger.info(f"Randevu {appointment_id} durumu '{status}' olarak güncelleniyor.")
+        logger.info("updating_stock", item_name=item_name, quantity=quantity, operation=operation)
 
         try:
-            # Veritabanı güncellemesi simülasyonu
-            for appt in FAKE_APPOINTMENTS_DB:
-                if appt["appointment_id"] == appointment_id:
-                    appt["status"] = status
-                    appt["updated_at"] = datetime.now().isoformat()
+            # First, get the item to find its ID
+            item = await self.db_manager.get_item(item_name)
+            if not item:
+                return {"error": "Ürün bulunamadı", "success": False}
 
-                    # Metrik güncelle
-                    if status == "Onaylandı":
-                        call_metrics.update("confirmed")
-                    elif status == "İptal Edildi":
-                        call_metrics.update("cancelled")
-                    elif status.startswith("Ertelendi"):
-                        call_metrics.update("rescheduled")
+            # Update stock
+            success = await self.db_manager.update_stock(
+                item_id=item["item_id"],
+                quantity=quantity,
+                operation=operation
+            )
 
-                    # Log kaydet
-                    self._log_conversation_event("appointment_updated", {
-                        "appointment_id": appointment_id,
-                        "new_status": status
-                    })
+            if not success:
+                return {"error": "Stok güncellenemedi", "success": False}
 
-                    return {
-                        "message": f"Randevu durumu başarıyla '{status}' olarak güncellendi.",
-                        "success": True,
-                        "appointment_id": appointment_id
-                    }
+            # Get updated stock info
+            updated_item = await self.db_manager.get_item(item_name)
 
-            return {"error": "Randevu bulunamadı", "success": False}
+            return {
+                "message": f"Güncellendi. Yeni stok: {updated_item['quantity']} adet.",
+                "success": True,
+                "item_name": updated_item["name"],
+                "new_quantity": updated_item["quantity"],
+                "operation": operation,
+                "amount": quantity
+            }
 
         except Exception as e:
-            logger.error(f"update_appointment_status hatası: {e}", exc_info=True)
+            logger.error("update_stock_error", error=str(e), item_name=item_name)
             return {"error": f"Güncelleme başarısız: {str(e)}", "success": False}
 
-    @function_tool
-    async def find_available_slots(self, context: RunContext):
-        """
-        Müşterinin randevusunu ertelemek istemesi durumunda uygun olan
-        en   yakın zaman dilimlerini bulur.
 
-        Returns:
-            Dict: Uygun zaman dilimleri listesi
-        """
-        logger.info("Uygun zaman dilimleri aranıyor...")
-
-        try:
-            # Gerçek uygulamada bu veritabanından gelecek
-            available_slots = [
-                "5 Ekim Cumartesi 11:00",
-                "7 Ekim Pazartesi 09:30",
-                "8 Ekim Salı 15:45"
-            ]
-
-            self._log_conversation_event("slots_requested", {
-                "available_slots": available_slots
-            })
-
-            return {
-                "slots": available_slots,
-                "message": f"Şu tarihler uygun: {', '.join(available_slots)}",
-                "success": True
-            }
-
-        except Exception as e:
-            logger.error(f"find_available_slots hatası: {e}", exc_info=True)
-            return {
-                "error": "Uygun tarihler alınamadı",
-                "success": False
-            }
-
-    @function_tool
-    async def end_call(self, context: RunContext, reason: str):
-        """
-        Aramayı sonlandırır ve metrikleri kaydeder.
-
-        Args:
-            reason: Sonlandırma nedeni ('confirmed', 'cancelled', 'rescheduled', 'no_response', 'error')
-        """
-        duration = (datetime.now() - self.conversation_start_time).total_seconds()
-
-        logger.info(f"Arama sonlandırılıyor. Sebep: {reason}, Süre: {duration}s")
-
-        # Metrikleri güncelle
-        call_metrics.update(reason, duration)
-
-        # Son konuşma kaydı
-        self._log_conversation_event("call_ended", {
-            "reason": reason,
-            "duration_seconds": duration,
-            "appointment_id": self.appointment_id
-        })
-
-        # Session'ı kapat
-        try:
-            if hasattr(context, 'session') and context.session:
-                await context.session.close()
-        except Exception as e:
-            logger.error(f"Session kapatma hatası: {e}")
-
-        return {
-            "message": "Arama sonlandırıldı",
-            "reason": reason,
-            "duration": duration
-        }
-
-    @function_tool
-    async def handle_no_response(self, context: RunContext):
-        """
-        Müşteri yanıt vermediğinde çağrılır.
-        """
-        self.no_response_count += 1
-        logger.warning(f"Yanıtsızlık sayısı: {self.no_response_count}/{self.max_no_response}")
-
-        if self.no_response_count >= self.max_no_response:
-            await self.end_call(context, "no_response")
-            return {
-                "message": "Maksimum yanıtsızlık sayısına ulaşıldı, arama sonlandırılıyor",
-                "should_end": True
-            }
-
-        return {
-            "message": f"Yanıtsızlık kaydedildi ({self.no_response_count}/{self.max_no_response})",
-            "should_end": False
-        }
-
-    def _log_conversation_event(self, event_type: str, data: dict):
-        """Konuşma olaylarını kaydet"""
-        log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "appointment_id": self.appointment_id,
-            "event_type": event_type,
-            "data": data
-        }
-        CONVERSATION_LOGS.append(log_entry)
-
-        # Gerçek uygulamada bu veritabanına yazılmalı
-        logger.debug(f"Konuşma olayı kaydedildi: {event_type}")
+# Global manager references (initialized in entrypoint)
+_db_manager: Optional[DatabaseManager] = None
 
 
 def prewarm(proc: JobProcess):
-    """Agent başlatılmadan önce gerekli kaynakları yükle"""
-    logger.info("Prewarm başlatılıyor...")
-    proc.userdata["vad"] = silero.VAD.load(sensitivity=0.5)
-    logger.info("VAD modeli yüklendi")
+    """Agent başlatılmadan önce gerekli kaynakları yükle."""
+    logger.info("prewarm_starting")
+    proc.userdata["vad"] = silero.VAD.load()
+    logger.info("vad_model_loaded")
 
 
 async def entrypoint(ctx: JobContext):
-    """Agent'ın ana giriş noktası"""
+    """Agent'ın ana giriş noktası."""
+    global _db_manager
+    
     ctx.log_context_fields = {"room": ctx.room.name}
 
-    # Room metadata'dan appointment_id'yi al
-    appointment_id = None
+    # Initialize infrastructure connections
+    try:
+        if _db_manager is None:
+            _db_manager = await init_database()
+    except Exception as e:
+        logger.error("infrastructure_init_failed", error=str(e))
+        raise
+
+    # Parse room metadata
+    staff_name = "Personel"
+
     try:
         metadata = ctx.room.metadata
         if metadata:
             metadata_dict = json.loads(metadata)
-            appointment_id = metadata_dict.get("appointment_id")
-            logger.info(f"Appointment ID alındı: {appointment_id}")
+            staff_name = metadata_dict.get("staff_name") or staff_name
+            logger.info(
+                "metadata_parsed",
+                staff_name=staff_name
+            )
     except Exception as e:
-        logger.warning(f"Metadata parsing hatası: {e}")
+        logger.warning("metadata_parse_error", error=str(e))
 
-    # STT ve LLM modellerini çevre değişkenlerinden oku
+    # Model configuration
     stt_model = os.getenv("STT_MODEL", "deepgram/nova-2-streaming:tr")
-    llm_model = os.getenv("LLM_MODEL", "openai/gpt-4o-mini")
+    llm_model = os.getenv("LLM_MODEL", "gemini-1.5-flash")
+    logger.info("models_configured", stt=stt_model, llm=llm_model)
 
-    logger.info(f"STT Model: {stt_model}, LLM Model: {llm_model}")
+    # API Key validation
+    eleven_api_key = os.getenv("ELEVEN_API_KEY")
+    if not eleven_api_key:
+        logger.error("missing_api_key", key="ELEVEN_API_KEY")
+        raise ValueError("ELEVEN_API_KEY gerekli")
 
-    # ElevenLabs ayarları
-    elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
-    if not elevenlabs_api_key:
-        logger.error("ELEVENLABS_API_KEY bulunamadı!")
-        raise ValueError("ELEVENLABS_API_KEY gerekli")
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+    if not google_api_key:
+        logger.error("missing_api_key", key="GOOGLE_API_KEY")
+        raise ValueError("GOOGLE_API_KEY gerekli")
 
-    # AgentSession'ı kur
-    session = AgentSession(
-        stt=stt_model,
-        llm=llm_model,
-        tts=elevenlabs.TTS(
-            model_id="eleven_multilingual_v2",
-            voice_id="21m00Tcm4TlvDq8ikWAM",  # Rachel - profesyonel ses
-            # Alternatif Türkçe sesler:
-            # voice_id="pNInz6obpgDQGcFmaJgB" # Adam (erkek)
-        ),
-        turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        preemptive_generation=True,
-    )
+    logger.info("api_keys_validated")
 
+    # Create AgentSession
+    logger.info("creating_agent_session")
+    try:
+        session = AgentSession(
+            stt=stt_model,
+            llm=llm_model,
+            tts=elevenlabs.TTS(
+                model="eleven_multilingual_v2",
+                voice_id="21m00Tcm4TlvDq8ikWAM",
+            ),
+            turn_detection=MultilingualModel(),
+            vad=ctx.proc.userdata["vad"],
+            preemptive_generation=True,
+        )
+        logger.info("agent_session_created")
+    except Exception as e:
+        logger.error("agent_session_creation_failed", error=str(e))
+        raise
+
+    # Metrics collector
     usage_collector = metrics.UsageCollector()
 
     @session.on("metrics_collected")
@@ -383,69 +336,50 @@ async def entrypoint(ctx: JobContext):
 
     @session.on("transcript_received")
     def _on_transcript(transcript):
-        """Transkriptleri kaydet"""
-        logger.info(f"Transkript: {transcript.text}")
-        # Gerçek uygulamada veritabanına kaydet
+        logger.info("transcript_received", text=transcript.text)
 
-    async def log_usage():
-        """Kullanım istatistiklerini kaydet"""
-        summary = usage_collector.get_summary()
-        metrics_summary = call_metrics.get_summary()
-
-        logger.info(f"Agent Usage: {summary}")
-        logger.info(f"Call Metrics: {metrics_summary}")
-
-        try:
-            combined_metadata = {
-                "usage_summary": summary,
-                "call_metrics": metrics_summary,
-                "conversation_logs": CONVERSATION_LOGS[-10:]  # Son 10 olay
-            }
-            await ctx.room.send_participant_metadata(json.dumps(combined_metadata))
-        except Exception as e:
-            logger.warning(f"Metadata gönderme hatası: {e}")
-
-    ctx.add_shutdown_callback(log_usage)
-
-    # Session'ı başlat
+    # Start session with injected dependencies
+    logger.info("starting_session")
     try:
-        await session.start(
-            agent=Assistant(appointment_id=appointment_id),
-            room=ctx.room,
-            room_input_options=RoomInputOptions(
-                noise_cancellation=noise_cancellation.BVC(),
-                audio_profile="telephony",
-            ),
-        )
-        logger.info(f"Session başarıyla başlatıldı: {ctx.room.name}")
+        async with asyncio.timeout(10):
+            await session.start(
+                agent=Assistant(
+                    db_manager=_db_manager,
+                    staff_name=staff_name
+                ),
+                room=ctx.room,
+                room_input_options=RoomInputOptions(
+                    noise_cancellation=noise_cancellation.BVC(),
+                ),
+            )
+            logger.info("session_started", room=ctx.room.name)
     except Exception as e:
-        logger.error(f"Session başlatma hatası: {e}", exc_info=True)
+        logger.error("session_start_failed", error=str(e))
         raise
 
-    # Bağlantıyı kur
+    # Connect to room
+    logger.info("connecting_to_room")
     try:
-        await ctx.connect()
-        logger.info(f"Bağlantı kuruldu: {ctx.room.name}")
+        async with asyncio.timeout(5):
+            await ctx.connect()
+            logger.info("room_connected", room=ctx.room.name)
     except Exception as e:
-        logger.error(f"Bağlantı hatası: {e}", exc_info=True)
+        logger.error("room_connection_failed", error=str(e))
         raise
+
+    # Log usage summary
+    summary = usage_collector.get_summary()
+    logger.info("usage_summary", livekit_usage=summary)
 
 
 if __name__ == "__main__":
-    log_level = os.getenv("LOG_LEVEL", "INFO")
-    logging.basicConfig(
-        level=getattr(logging, log_level),
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-
-    logger.info("Agent başlatılıyor...")
-    logger.info(f"Log seviyesi: {log_level}")
+    configure_logging()
+    
+    logger.info("agent_starting")
 
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
-            prewarm_fnc=prewarm,
-            max_sessions=10
+            prewarm_fnc=prewarm
         )
     )
